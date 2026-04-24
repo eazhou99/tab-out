@@ -345,63 +345,154 @@ function playCloseSound() {
  * Pure CSS + JS, no libraries.
  */
 function shootConfetti(x, y) {
+  // Dopamine palette.
   const colors = [
-    '#c8713a', // amber
-    '#e8a070', // amber light
-    '#5a7a62', // sage
-    '#8aaa92', // sage light
-    '#5a6b7a', // slate
-    '#8a9baa', // slate light
-    '#d4b896', // warm paper
-    '#b35a5a', // rose
+    '#06b6d4', '#10b981', '#db6aa0', '#f59e0b',
+    '#a855f7', '#3b82f6', '#fb7185', '#facc15',
+    '#22d3ee', '#f472b6',
   ];
 
-  const particleCount = 17;
+  // Shape-specific physics recipes. Real confetti behaves differently
+  // by geometry — round bits fall fast (low drag), ribbons flutter
+  // slowly (high drag + heavy tumble), squares sit between.
+  const SHAPE_RECIPES = {
+    circle: {
+      drag:       1.2,   // horizontal velocity decay (1/s)
+      vDrag:      0.4,   // vertical drag (lighter — they sink)
+      gravity:    900,   // px/s^2
+      flutterAmp: 0.15,  // how much it wobbles (0 = none, 1 = flips edge-on)
+      spinRange:  420,   // deg/s
+    },
+    square: {
+      drag:       1.8,
+      vDrag:      0.9,
+      gravity:    620,
+      flutterAmp: 0.55,
+      spinRange:  540,
+    },
+    ribbon: {
+      drag:       2.4,
+      vDrag:      1.6,   // heavy air resistance — falls slowly
+      gravity:    420,
+      flutterAmp: 1.0,   // flips fully edge-on
+      spinRange:  720,
+    },
+  };
+  const SHAPES = Object.keys(SHAPE_RECIPES);
+
+  const particleCount = 44;
 
   for (let i = 0; i < particleCount; i++) {
     const el = document.createElement('div');
 
-    const isCircle = Math.random() > 0.5;
-    const size = 5 + Math.random() * 6; // 5–11px
-    const color = colors[Math.floor(Math.random() * colors.length)];
+    const shape   = SHAPES[Math.floor(Math.random() * SHAPES.length)];
+    const recipe  = SHAPE_RECIPES[shape];
+    const color   = colors[Math.floor(Math.random() * colors.length)];
 
+    // Size per shape
+    let width, height, radius;
+    if (shape === 'circle') {
+      const d = 5 + Math.random() * 6;
+      width = height = d;
+      radius = '50%';
+    } else if (shape === 'ribbon') {
+      width  = 4 + Math.random() * 3;       // 4–7 px
+      height = 12 + Math.random() * 14;     // 12–26 px tall
+      radius = '1px';
+    } else {
+      const d = 6 + Math.random() * 6;
+      width = height = d;
+      radius = '1px';
+    }
+
+    // Subtle back-face shading — a slight inset darkening so when the
+    // paper flips edge-on you briefly see a plausible shadow tone.
     el.style.cssText = `
       position: fixed;
       left: ${x}px;
       top: ${y}px;
-      width: ${size}px;
-      height: ${size}px;
+      width: ${width}px;
+      height: ${height}px;
       background: ${color};
-      border-radius: ${isCircle ? '50%' : '2px'};
+      border-radius: ${radius};
       pointer-events: none;
       z-index: 9999;
       transform: translate(-50%, -50%);
       opacity: 1;
+      box-shadow: inset 0 -1px 0 rgba(0,0,0,0.22), 0 1px 2px rgba(0,0,0,0.12);
+      will-change: transform, opacity;
     `;
     document.body.appendChild(el);
 
-    // Physics: random angle and speed for the outward burst
-    const angle   = Math.random() * Math.PI * 2;
-    const speed   = 60 + Math.random() * 120;
-    const vx      = Math.cos(angle) * speed;
-    const vy      = Math.sin(angle) * speed - 80; // bias upward
-    const gravity = 200;
+    // --- Initial burst: cone-shaped upward-biased explosion ---
+    // Picking from full 360° then biasing vy upward gives a natural
+    // mortar-style spread rather than a flat disk.
+    const burstAngle = Math.random() * Math.PI * 2;
+    const burstSpeed = 160 + Math.random() * 260;           // 160–420 px/s
+    let vx = Math.cos(burstAngle) * burstSpeed;
+    let vy = Math.sin(burstAngle) * burstSpeed - (180 + Math.random() * 160); // strong upward kick
+
+    // --- Wind drift — each particle has its own breeze. Sine wave
+    //      on x over time, small amplitude, so they sway rather than
+    //      travel straight. ---
+    const windFreq  = 0.8 + Math.random() * 1.6;   // Hz
+    const windAmp   = 18 + Math.random() * 28;     // px amplitude
+    const windPhase = Math.random() * Math.PI * 2;
+
+    // --- Tumble (3D rotation). Independent axes give realistic
+    //      tumbling-paper look. Perspective is baked into transform
+    //      so we don't touch body styles. ---
+    const rotX0 = Math.random() * 360;
+    const rotY0 = Math.random() * 360;
+    const rotZ0 = Math.random() * 360;
+    const rotXv = (Math.random() * 2 - 1) * recipe.spinRange * (0.6 + recipe.flutterAmp);
+    const rotYv = (Math.random() * 2 - 1) * recipe.spinRange * (0.8 + recipe.flutterAmp);
+    const rotZv = (Math.random() * 2 - 1) * recipe.spinRange * 0.5;
+
+    // --- Lifetime varies by recipe — ribbons linger, circles settle. ---
+    const duration = (shape === 'ribbon' ? 2800 : shape === 'square' ? 2200 : 1600)
+                     + Math.random() * 700;
 
     const startTime = performance.now();
-    const duration  = 700 + Math.random() * 200; // 700–900ms
+    let   lastT     = startTime;
+    let   px        = 0;
+    let   py        = 0;
 
     function frame(now) {
+      const dt = Math.min((now - lastT) / 1000, 0.033); // clamp to avoid jumps
+      lastT = now;
       const elapsed  = (now - startTime) / 1000;
-      const progress = elapsed / (duration / 1000);
+      const progress = (now - startTime) / duration;
 
       if (progress >= 1) { el.remove(); return; }
 
-      const px = vx * elapsed;
-      const py = vy * elapsed + 0.5 * gravity * elapsed * elapsed;
-      const opacity = progress < 0.5 ? 1 : 1 - (progress - 0.5) * 2;
-      const rotate  = elapsed * 200 * (isCircle ? 0 : 1);
+      // Integrate with exponential drag so velocities decay naturally.
+      const horizDecay = Math.exp(-recipe.drag  * dt);
+      const vertDecay  = Math.exp(-recipe.vDrag * dt);
+      vx *= horizDecay;
+      vy  = vy * vertDecay + recipe.gravity * dt;
 
-      el.style.transform = `translate(calc(-50% + ${px}px), calc(-50% + ${py}px)) rotate(${rotate}deg)`;
+      px += vx * dt;
+      py += vy * dt;
+
+      // Wind: sinusoidal lateral drift, ramps in (not instant).
+      const windRamp = Math.min(elapsed * 1.5, 1);
+      const windDx   = Math.sin(elapsed * Math.PI * 2 * windFreq + windPhase) * windAmp * windRamp;
+
+      // Tumble
+      const rotX = rotX0 + rotXv * elapsed;
+      const rotY = rotY0 + rotYv * elapsed;
+      const rotZ = rotZ0 + rotZv * elapsed;
+
+      // Fade: hold full opacity most of the life, fade softly near end.
+      const opacity = progress < 0.78 ? 1 : 1 - (progress - 0.78) / 0.22;
+
+      // Perspective baked into transform gives a real 3D flip rather
+      // than a flat skew. 420 is a middle-ground focal distance.
+      el.style.transform =
+        `translate(calc(-50% + ${px + windDx}px), calc(-50% + ${py}px)) ` +
+        `perspective(420px) ` +
+        `rotateX(${rotX}deg) rotateY(${rotY}deg) rotateZ(${rotZ}deg)`;
       el.style.opacity = opacity;
 
       requestAnimationFrame(frame);
