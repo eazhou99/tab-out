@@ -11,7 +11,7 @@
 
   <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body class="first-render">
 <div class="container">
 
 
@@ -54,7 +54,7 @@
        ================================================================ -->
   <div class="dashboard-columns" id="dashboardColumns">
 
-    <!-- LEFT COLUMN: Open tabs -->
+    <!-- LEFT COLUMN: Open tabs (simple again — no search or sync here) -->
     <div class="active-section" id="openTabsSection" style="display:none">
       <div class="section-header">
         <h2 id="openTabsSectionTitle">Right now</h2>
@@ -64,33 +64,39 @@
       <div class="missions" id="openTabsMissions"></div>
     </div>
 
-    <!-- RIGHT COLUMN: Saved for Later checklist -->
-    <div class="deferred-column" id="deferredColumn" style="display:none">
-      <div class="section-header">
-        <h2>Saved for later</h2>
-        <div class="section-line"></div>
-        <div class="section-count" id="deferredCount"></div>
+    <!-- RIGHT COLUMN: search lives above the Reading card -->
+    <div class="reading-side">
+      <!-- Open-tabs search; results draggable into any reading group -->
+      <div class="reading-search">
+        <svg class="reading-search-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
+        </svg>
+        <input type="text" id="readingSearch" placeholder="搜索 open tabs…" autocomplete="off" spellcheck="false" />
+        <button class="reading-search-clear" id="readingSearchClear" title="清空" style="display:none">×</button>
       </div>
+      <div class="reading-search-results" id="readingSearchResults" style="display:none"></div>
 
-      <!-- Active checklist items — injected by renderDeferredList() in app.js -->
-      <div class="deferred-list" id="deferredList"></div>
-
-      <!-- Empty state — shown when no active deferred tabs -->
-      <div class="deferred-empty" id="deferredEmpty" style="display:none">
-        Nothing saved. Living in the moment.
-      </div>
-
-      <!-- Archive section — collapsed by default -->
-      <div class="deferred-archive" id="deferredArchive" style="display:none">
-        <button class="archive-toggle" id="archiveToggle">
-          <svg class="archive-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" /></svg>
-          Archive
-          <span class="archive-count" id="archiveCount"></span>
-        </button>
-        <div class="archive-body" id="archiveBody" style="display:none">
-          <input type="text" class="archive-search" id="archiveSearch" placeholder="Search archived tabs...">
-          <div class="archive-list" id="archiveList"></div>
+      <!-- Reading groups + 待整理 bucket -->
+      <div class="deferred-column" id="deferredColumn" style="display:none">
+        <div class="section-header">
+          <h2>Reading</h2>
+          <div class="section-line"></div>
+          <div class="section-count" id="deferredCount"></div>
+          <button class="export-btn" id="exportBtn" data-action="export-obsidian" title="同步到 Obsidian 网页清单.md">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
+            </svg>
+          </button>
         </div>
+
+        <!-- "+ 新建分组" button — sits at the top, above all groups -->
+        <button class="new-group-btn" id="newGroupBtn" data-action="new-group">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>
+          新建分组
+        </button>
+
+        <!-- Groups + 待整理 — injected by renderDeferredColumn() in app.js -->
+        <div class="groups-wrap" id="groupsWrap"></div>
       </div>
     </div>
 

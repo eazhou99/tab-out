@@ -201,86 +201,142 @@ async function closeTabOutDupes() {
 /* ----------------------------------------------------------------
    SAVED FOR LATER — chrome.storage.local
 
-   Replaces the old server-side SQLite + REST API with Chrome's
-   built-in key-value storage. Data persists across browser sessions
-   and doesn't require a running server.
+   Two collections:
+     groups:   [{ id, name, createdAt, collapsed }]
+     deferred: [{ id, url, title, savedAt, groupId }]   // groupId=null -> "待整理"
 
-   Data shape stored under the "deferred" key:
-   [
-     {
-       id: "1712345678901",          // timestamp-based unique ID
-       url: "https://example.com",
-       title: "Example Page",
-       savedAt: "2026-04-04T10:00:00.000Z",  // ISO date string
-       completed: false,             // true = checked off (archived)
-       dismissed: false              // true = dismissed without reading
-     },
-     ...
-   ]
+   Old shape (pre-groups) had `completed` / `dismissed` flags and no `groupId`.
+   migrateLegacyDeferred() upgrades it on first read.
    ---------------------------------------------------------------- */
 
-/**
- * saveTabForLater(tab)
- *
- * Saves a single tab to the "Saved for Later" list in chrome.storage.local.
- * @param {{ url: string, title: string }} tab
- */
-async function saveTabForLater(tab) {
+const UNSORTED_GROUP_ID = null; // "待整理" bucket has no group row
+
+async function migrateLegacyDeferred(deferred) {
+  let changed = false;
+  const upgraded = [];
+  for (const t of deferred) {
+    if (t.dismissed) { changed = true; continue; } // drop dismissed
+    if ('completed' in t || 'dismissed' in t || 'completedAt' in t || !('groupId' in t)) {
+      upgraded.push({
+        id:      t.id,
+        url:     t.url,
+        title:   t.title,
+        savedAt: t.savedAt,
+        groupId: t.groupId ?? UNSORTED_GROUP_ID,
+      });
+      changed = true;
+    } else {
+      upgraded.push(t);
+    }
+  }
+  if (changed) await chrome.storage.local.set({ deferred: upgraded });
+  return upgraded;
+}
+
+async function getDeferredItems() {
   const { deferred = [] } = await chrome.storage.local.get('deferred');
-  deferred.push({
-    id:        Date.now().toString(),
-    url:       tab.url,
-    title:     tab.title,
-    savedAt:   new Date().toISOString(),
-    completed: false,
-    dismissed: false,
-  });
+  return migrateLegacyDeferred(deferred);
+}
+
+async function getGroups() {
+  const { groups = [] } = await chrome.storage.local.get('groups');
+  return groups;
+}
+
+async function createGroup(name) {
+  const groups = await getGroups();
+  const group = {
+    id:        'g' + Date.now().toString(),
+    name:      (name || '新分组').trim() || '新分组',
+    createdAt: new Date().toISOString(),
+    collapsed: false,
+  };
+  groups.push(group);
+  await chrome.storage.local.set({ groups });
+  return group;
+}
+
+async function renameGroup(id, name) {
+  const groups = await getGroups();
+  const g = groups.find(x => x.id === id);
+  if (!g) return;
+  g.name = (name || '').trim() || g.name;
+  await chrome.storage.local.set({ groups });
+}
+
+async function deleteGroup(id) {
+  const groups = await getGroups();
+  const idx = groups.findIndex(x => x.id === id);
+  if (idx === -1) return;
+  groups.splice(idx, 1);
+  // Orphaned items fall back to "待整理"
+  const deferred = await getDeferredItems();
+  for (const t of deferred) if (t.groupId === id) t.groupId = UNSORTED_GROUP_ID;
+  await chrome.storage.local.set({ groups, deferred });
+}
+
+async function toggleGroupCollapsed(id) {
+  const groups = await getGroups();
+  const g = groups.find(x => x.id === id);
+  if (!g) return;
+  g.collapsed = !g.collapsed;
+  await chrome.storage.local.set({ groups });
+}
+
+async function getUnsortedCollapsed() {
+  const { unsortedCollapsed = false } = await chrome.storage.local.get('unsortedCollapsed');
+  return !!unsortedCollapsed;
+}
+
+async function toggleUnsortedCollapsed() {
+  const cur = await getUnsortedCollapsed();
+  await chrome.storage.local.set({ unsortedCollapsed: !cur });
+}
+
+async function moveGroup(id, toIndex) {
+  const groups = await getGroups();
+  const fromIdx = groups.findIndex(g => g.id === id);
+  if (fromIdx === -1) return;
+  const [g] = groups.splice(fromIdx, 1);
+  const clamped = Math.max(0, Math.min(toIndex, groups.length));
+  groups.splice(clamped, 0, g);
+  await chrome.storage.local.set({ groups });
+}
+
+/**
+ * saveTabToGroup(tab, groupId)
+ *
+ * Saves a tab into the given group (or "待整理" if groupId is null).
+ * Returns the created item.
+ */
+async function saveTabToGroup(tab, groupId = UNSORTED_GROUP_ID) {
+  const deferred = await getDeferredItems();
+  const item = {
+    id:      Date.now().toString(),
+    url:     tab.url,
+    title:   tab.title,
+    savedAt: new Date().toISOString(),
+    groupId,
+  };
+  deferred.push(item);
+  await chrome.storage.local.set({ deferred });
+  return item;
+}
+
+async function moveItemToGroup(itemId, groupId) {
+  const deferred = await getDeferredItems();
+  const t = deferred.find(x => x.id === itemId);
+  if (!t) return;
+  t.groupId = groupId;
   await chrome.storage.local.set({ deferred });
 }
 
-/**
- * getSavedTabs()
- *
- * Returns all saved tabs from chrome.storage.local.
- * Filters out dismissed items (those are gone for good).
- * Splits into active (not completed) and archived (completed).
- */
-async function getSavedTabs() {
-  const { deferred = [] } = await chrome.storage.local.get('deferred');
-  const visible = deferred.filter(t => !t.dismissed);
-  return {
-    active:   visible.filter(t => !t.completed),
-    archived: visible.filter(t => t.completed),
-  };
-}
-
-/**
- * checkOffSavedTab(id)
- *
- * Marks a saved tab as completed (checked off). It moves to the archive.
- */
-async function checkOffSavedTab(id) {
-  const { deferred = [] } = await chrome.storage.local.get('deferred');
-  const tab = deferred.find(t => t.id === id);
-  if (tab) {
-    tab.completed = true;
-    tab.completedAt = new Date().toISOString();
-    await chrome.storage.local.set({ deferred });
-  }
-}
-
-/**
- * dismissSavedTab(id)
- *
- * Marks a saved tab as dismissed (removed from all lists).
- */
-async function dismissSavedTab(id) {
-  const { deferred = [] } = await chrome.storage.local.get('deferred');
-  const tab = deferred.find(t => t.id === id);
-  if (tab) {
-    tab.dismissed = true;
-    await chrome.storage.local.set({ deferred });
-  }
+async function removeSavedItem(id) {
+  const deferred = await getDeferredItems();
+  const idx = deferred.findIndex(x => x.id === id);
+  if (idx === -1) return;
+  deferred.splice(idx, 1);
+  await chrome.storage.local.set({ deferred });
 }
 
 
@@ -799,6 +855,10 @@ const ICONS = {
    ---------------------------------------------------------------- */
 let domainGroups = [];
 
+// Domains whose "+N more" overflow has been expanded by the user.
+// Persisted in-memory across re-renders so dragging items doesn't auto-collapse.
+const expandedDomains = new Set();
+
 
 /* ----------------------------------------------------------------
    HELPER: filter out browser-internal pages
@@ -859,7 +919,7 @@ function buildOverflowChips(hiddenTabs, urlCounts = {}) {
     let domain = '';
     try { domain = new URL(tab.url).hostname; } catch {}
     const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
-    return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
+    return `<div class="page-chip clickable${chipClass}" draggable="true" data-action="focus-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="${safeTitle}">
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
       <span class="chip-text">${label}</span>${dupeTag}
       <div class="chip-actions">
@@ -922,8 +982,10 @@ function renderDomainCard(group) {
     if (!seen.has(tab.url)) { seen.add(tab.url); uniqueTabs.push(tab); }
   }
 
-  const visibleTabs = uniqueTabs.slice(0, 8);
-  const extraCount  = uniqueTabs.length - visibleTabs.length;
+  const isExpanded  = expandedDomains.has(stableId);
+  const hasOverflow = uniqueTabs.length > 8;
+  const visibleTabs = isExpanded ? uniqueTabs : uniqueTabs.slice(0, 8);
+  const extraCount  = isExpanded ? 0 : (uniqueTabs.length - visibleTabs.length);
 
   const pageChips = visibleTabs.map(tab => {
     let label = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), group.domain);
@@ -940,7 +1002,7 @@ function renderDomainCard(group) {
     let domain = '';
     try { domain = new URL(tab.url).hostname; } catch {}
     const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
-    return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
+    return `<div class="page-chip clickable${chipClass}" draggable="true" data-action="focus-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="${safeTitle}">
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
       <span class="chip-text">${label}</span>${dupeTag}
       <div class="chip-actions">
@@ -952,7 +1014,11 @@ function renderDomainCard(group) {
         </button>
       </div>
     </div>`;
-  }).join('') + (extraCount > 0 ? buildOverflowChips(uniqueTabs.slice(8), urlCounts) : '');
+  }).join('')
+    + (extraCount > 0 ? buildOverflowChips(uniqueTabs.slice(8), urlCounts) : '')
+    + (isExpanded && hasOverflow
+        ? `<div class="page-chip page-chip-overflow clickable" data-action="collapse-chips" data-domain-id="${stableId}"><span class="chip-text">↑ 收起</span></div>`
+        : '');
 
   let actionsHtml = `
     <button class="action-btn close-tabs" data-action="close-domain-tabs" data-domain-id="${stableId}">
@@ -969,7 +1035,7 @@ function renderDomainCard(group) {
   }
 
   return `
-    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" data-domain-id="${stableId}">
+    <div class="mission-card domain-card ${hasDupes ? 'has-amber-bar' : 'has-neutral-bar'}" draggable="true" data-domain-id="${stableId}">
       <div class="status-bar"></div>
       <div class="mission-content">
         <div class="mission-top">
@@ -995,76 +1061,94 @@ function renderDomainCard(group) {
 /**
  * renderDeferredColumn()
  *
- * Reads saved tabs from chrome.storage.local and renders the right-side
- * "Saved for Later" checklist column. Shows active items as a checklist
- * and completed items in a collapsible archive.
+ * Renders the right-side reading column: one section per user-defined group,
+ * plus a permanent "待整理" bucket at the bottom for items saved without a group.
+ * Each section is a drop target; chips and saved items are draggable.
  */
 async function renderDeferredColumn() {
-  const column         = document.getElementById('deferredColumn');
-  const list           = document.getElementById('deferredList');
-  const empty          = document.getElementById('deferredEmpty');
-  const countEl        = document.getElementById('deferredCount');
-  const archiveEl      = document.getElementById('deferredArchive');
-  const archiveCountEl = document.getElementById('archiveCount');
-  const archiveList    = document.getElementById('archiveList');
-
-  if (!column) return;
+  const column   = document.getElementById('deferredColumn');
+  const wrap     = document.getElementById('groupsWrap');
+  const countEl  = document.getElementById('deferredCount');
+  if (!column || !wrap) return;
 
   try {
-    const { active, archived } = await getSavedTabs();
+    const [groups, items] = await Promise.all([getGroups(), getDeferredItems()]);
 
-    // Hide the entire column if there's nothing to show
-    if (active.length === 0 && archived.length === 0) {
-      column.style.display = 'none';
-      return;
-    }
-
+    // Column is always shown so the "+ 新建分组" button stays reachable.
     column.style.display = 'block';
 
-    // Render active checklist items
-    if (active.length > 0) {
-      countEl.textContent = `${active.length} item${active.length !== 1 ? 's' : ''}`;
-      list.innerHTML = active.map(item => renderDeferredItem(item)).join('');
-      list.style.display = 'block';
-      empty.style.display = 'none';
-    } else {
-      list.style.display = 'none';
-      countEl.textContent = '';
-      empty.style.display = 'block';
-    }
+    const totalItems = items.length;
+    countEl.textContent = totalItems > 0
+      ? `${totalItems} item${totalItems !== 1 ? 's' : ''}`
+      : '';
 
-    // Render archive section
-    if (archived.length > 0) {
-      archiveCountEl.textContent = `(${archived.length})`;
-      archiveList.innerHTML = archived.map(item => renderArchiveItem(item)).join('');
-      archiveEl.style.display = 'block';
-    } else {
-      archiveEl.style.display = 'none';
+    const sections = [];
+    for (const g of groups) {
+      const groupItems = items.filter(t => t.groupId === g.id);
+      sections.push(renderGroupSection(g, groupItems));
     }
+    // Always-present "待整理" bucket
+    const unsortedItems = items.filter(t => t.groupId == null);
+    const unsortedCollapsed = await getUnsortedCollapsed();
+    sections.push(renderUnsortedSection(unsortedItems, unsortedCollapsed));
 
+    wrap.innerHTML = sections.join('');
   } catch (err) {
-    console.warn('[tab-out] Could not load saved tabs:', err);
-    column.style.display = 'none';
+    console.warn('[tab-out] Could not render reading column:', err);
   }
 }
 
-/**
- * renderDeferredItem(item)
- *
- * Builds HTML for one active checklist item: checkbox, title link,
- * domain, time ago, dismiss button.
- */
+function renderGroupSection(group, items) {
+  const safeName = (group.name || '').replace(/</g, '&lt;');
+  const collapsed = group.collapsed ? ' collapsed' : '';
+  const itemsHtml = items.map(renderDeferredItem).join('');
+
+  return `
+    <section class="group-section${collapsed}" data-group-id="${group.id}">
+      <div class="group-header">
+        <span class="group-handle" draggable="true" title="拖动调整顺序">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24"><circle cx="9" cy="6" r="1.5"/><circle cx="15" cy="6" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="18" r="1.5"/><circle cx="15" cy="18" r="1.5"/></svg>
+        </span>
+        <button class="group-toggle" data-action="toggle-group" data-group-id="${group.id}" title="折叠/展开">
+          <svg class="group-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" /></svg>
+        </button>
+        <span class="group-name" data-action="rename-group" data-group-id="${group.id}" title="点击重命名">${safeName}</span>
+        <span class="group-count">${items.length}</span>
+        <button class="group-delete" data-action="delete-group" data-group-id="${group.id}" title="删除分组">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
+        </button>
+      </div>
+      <div class="group-body">${itemsHtml}</div>
+    </section>`;
+}
+
+function renderUnsortedSection(items, collapsed) {
+  const itemsHtml = items.map(renderDeferredItem).join('');
+  const collapsedCls = collapsed ? ' collapsed' : '';
+  return `
+    <section class="group-section unsorted-section${collapsedCls}" data-group-id="">
+      <div class="group-header">
+        <button class="group-toggle" data-action="toggle-unsorted" title="折叠/展开">
+          <svg class="group-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m19.5 8.25-7.5 7.5-7.5-7.5" /></svg>
+        </button>
+        <span class="group-name unsorted-label">待整理</span>
+        <span class="group-count">${items.length}</span>
+      </div>
+      <div class="group-body">${itemsHtml}</div>
+    </section>`;
+}
+
 function renderDeferredItem(item) {
   let domain = '';
   try { domain = new URL(item.url).hostname.replace(/^www\./, ''); } catch {}
   const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=16`;
   const ago = timeAgo(item.savedAt);
+  const safeTitle = (item.title || '').replace(/"/g, '&quot;');
 
   return `
-    <div class="deferred-item" data-deferred-id="${item.id}">
-      <input type="checkbox" class="deferred-checkbox" data-action="check-deferred" data-deferred-id="${item.id}">
+    <div class="deferred-item" draggable="true" data-deferred-id="${item.id}">
       <div class="deferred-info">
-        <a href="${item.url}" target="_blank" rel="noopener" class="deferred-title" title="${(item.title || '').replace(/"/g, '&quot;')}">
+        <a href="${item.url}" target="_blank" rel="noopener" class="deferred-title" title="${safeTitle}">
           <img src="${faviconUrl}" alt="" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px" onerror="this.style.display='none'">${item.title || item.url}
         </a>
         <div class="deferred-meta">
@@ -1072,25 +1156,9 @@ function renderDeferredItem(item) {
           <span>${ago}</span>
         </div>
       </div>
-      <button class="deferred-dismiss" data-action="dismiss-deferred" data-deferred-id="${item.id}" title="Dismiss">
+      <button class="deferred-dismiss" data-action="remove-deferred" data-deferred-id="${item.id}" title="Remove">
         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
       </button>
-    </div>`;
-}
-
-/**
- * renderArchiveItem(item)
- *
- * Builds HTML for one completed/archived item (simpler: just title + date).
- */
-function renderArchiveItem(item) {
-  const ago = item.completedAt ? timeAgo(item.completedAt) : timeAgo(item.savedAt);
-  return `
-    <div class="archive-item">
-      <a href="${item.url}" target="_blank" rel="noopener" class="archive-item-title" title="${(item.title || '').replace(/"/g, '&quot;')}">
-        ${item.title || item.url}
-      </a>
-      <span class="archive-item-date">${ago}</span>
     </div>`;
 }
 
@@ -1250,7 +1318,7 @@ async function renderStaticDashboard() {
 
   // --- Footer stats ---
   const statTabs = document.getElementById('statTabs');
-  if (statTabs) statTabs.textContent = openTabs.length;
+  if (statTabs) statTabs.textContent = getRealTabs().length;
 
   // --- Check for duplicate Tab Out tabs ---
   checkTabOutDupes();
@@ -1297,11 +1365,25 @@ document.addEventListener('click', async (e) => {
 
   // ---- Expand overflow chips ("+N more") ----
   if (action === 'expand-chips') {
+    const card = actionEl.closest('.mission-card');
+    const stableId = card?.dataset.domainId;
+    if (stableId) expandedDomains.add(stableId);
+    // Reveal hidden chips immediately + drop the "+N" button without re-render.
+    // Future re-renders (drag-drop) will honor expandedDomains and stay open.
     const overflowContainer = actionEl.parentElement.querySelector('.page-chips-overflow');
     if (overflowContainer) {
       overflowContainer.style.display = 'contents';
-      actionEl.remove();
+      // Replace the "+N" button with a "↑ 收起" button in place
+      actionEl.outerHTML = `<div class="page-chip page-chip-overflow clickable" data-action="collapse-chips" data-domain-id="${stableId}"><span class="chip-text">↑ 收起</span></div>`;
     }
+    return;
+  }
+
+  // ---- Collapse expanded chips ----
+  if (action === 'collapse-chips') {
+    const stableId = actionEl.dataset.domainId;
+    if (stableId) expandedDomains.delete(stableId);
+    await renderStaticDashboard();
     return;
   }
 
@@ -1349,35 +1431,32 @@ document.addEventListener('click', async (e) => {
 
     // Update footer
     const statTabs = document.getElementById('statTabs');
-    if (statTabs) statTabs.textContent = openTabs.length;
+    if (statTabs) statTabs.textContent = getRealTabs().length;
 
     showToast('Tab closed');
     return;
   }
 
-  // ---- Save a single tab for later (then close it) ----
+  // ---- Save a single tab for later (then close it) — goes to "待整理" ----
   if (action === 'defer-single-tab') {
     e.stopPropagation();
     const tabUrl   = actionEl.dataset.tabUrl;
     const tabTitle = actionEl.dataset.tabTitle || tabUrl;
     if (!tabUrl) return;
 
-    // Save to chrome.storage.local
     try {
-      await saveTabForLater({ url: tabUrl, title: tabTitle });
+      await saveTabToGroup({ url: tabUrl, title: tabTitle }, UNSORTED_GROUP_ID);
     } catch (err) {
       console.error('[tab-out] Failed to save tab:', err);
       showToast('Failed to save tab');
       return;
     }
 
-    // Close the tab in Chrome
     const allTabs = await chrome.tabs.query({});
     const match   = allTabs.find(t => t.url === tabUrl);
     if (match) await chrome.tabs.remove(match.id);
     await fetchOpenTabs();
 
-    // Animate chip out
     const chip = actionEl.closest('.page-chip');
     if (chip) {
       chip.style.transition = 'opacity 0.2s, transform 0.2s';
@@ -1386,39 +1465,17 @@ document.addEventListener('click', async (e) => {
       setTimeout(() => chip.remove(), 200);
     }
 
-    showToast('Saved for later');
+    showToast('Saved to 待整理');
     await renderDeferredColumn();
     return;
   }
 
-  // ---- Check off a saved tab (moves it to archive) ----
-  if (action === 'check-deferred') {
+  // ---- Remove a saved item (just deletes it) ----
+  if (action === 'remove-deferred') {
     const id = actionEl.dataset.deferredId;
     if (!id) return;
 
-    await checkOffSavedTab(id);
-
-    // Animate: strikethrough first, then slide out
-    const item = actionEl.closest('.deferred-item');
-    if (item) {
-      item.classList.add('checked');
-      setTimeout(() => {
-        item.classList.add('removing');
-        setTimeout(() => {
-          item.remove();
-          renderDeferredColumn(); // refresh counts and archive
-        }, 300);
-      }, 800);
-    }
-    return;
-  }
-
-  // ---- Dismiss a saved tab (removes it entirely) ----
-  if (action === 'dismiss-deferred') {
-    const id = actionEl.dataset.deferredId;
-    if (!id) return;
-
-    await dismissSavedTab(id);
+    await removeSavedItem(id);
 
     const item = actionEl.closest('.deferred-item');
     if (item) {
@@ -1428,6 +1485,66 @@ document.addEventListener('click', async (e) => {
         renderDeferredColumn();
       }, 300);
     }
+    return;
+  }
+
+  // ---- New group (prompt for name) ----
+  if (action === 'new-group') {
+    const name = window.prompt('分组名字？');
+    if (!name) return;
+    await createGroup(name);
+    await renderDeferredColumn();
+    return;
+  }
+
+  // ---- Rename group (click name) ----
+  if (action === 'rename-group') {
+    const id = actionEl.dataset.groupId;
+    if (!id) return;
+    const current = actionEl.textContent.trim();
+    const next = window.prompt('重命名分组', current);
+    if (next == null) return;
+    await renameGroup(id, next);
+    await renderDeferredColumn();
+    return;
+  }
+
+  // ---- Delete group (items fall back to 待整理) ----
+  if (action === 'delete-group') {
+    const id = actionEl.dataset.groupId;
+    if (!id) return;
+    const header = actionEl.closest('.group-header');
+    const groupName = header?.querySelector('.group-name')?.textContent?.trim() || '该分组';
+    const ok = await showConfirm(
+      `删除分组「${groupName}」？`,
+      '',
+      { okText: '确认删除', destructive: true }
+    );
+    if (!ok) return;
+    await deleteGroup(id);
+    await renderDeferredColumn();
+    return;
+  }
+
+  // ---- Export reading list to Obsidian ----
+  if (action === 'export-obsidian') {
+    await exportReadingToObsidian();
+    return;
+  }
+
+  // ---- Toggle unsorted ("待整理") collapsed ----
+  if (action === 'toggle-unsorted') {
+    await toggleUnsortedCollapsed();
+    await renderDeferredColumn();
+    return;
+  }
+
+  // ---- Toggle group collapsed ----
+  if (action === 'toggle-group') {
+    const id = actionEl.dataset.groupId;
+    if (!id) return;
+    await toggleGroupCollapsed(id);
+    await renderDeferredColumn();
     return;
   }
 
@@ -1463,7 +1580,7 @@ document.addEventListener('click', async (e) => {
     showToast(`Closed ${urls.length} tab${urls.length !== 1 ? 's' : ''} from ${groupLabel}`);
 
     const statTabs = document.getElementById('statTabs');
-    if (statTabs) statTabs.textContent = openTabs.length;
+    if (statTabs) statTabs.textContent = getRealTabs().length;
     return;
   }
 
@@ -1524,45 +1641,599 @@ document.addEventListener('click', async (e) => {
   }
 });
 
-// ---- Archive toggle — expand/collapse the archive section ----
-document.addEventListener('click', (e) => {
-  const toggle = e.target.closest('#archiveToggle');
-  if (!toggle) return;
 
-  toggle.classList.toggle('open');
-  const body = document.getElementById('archiveBody');
-  if (body) {
-    body.style.display = body.style.display === 'none' ? 'block' : 'none';
+
+/* ----------------------------------------------------------------
+   SEARCH — filter the user's currently-open tabs (left column)
+   ---------------------------------------------------------------- */
+
+function searchOpenTabs(query) {
+  if (!query || query.length < 2) return [];
+  const q = query.toLowerCase();
+
+  // De-dup by URL so the same tab opened in two windows shows once
+  const seen = new Map();
+  for (const t of openTabs) {
+    if (!t.url || t.isTabOut) continue;
+    if (t.url.startsWith('chrome://') || t.url.startsWith('chrome-extension://') || t.url.startsWith('about:')) continue;
+    const title = (t.title || '').toLowerCase();
+    const url   = t.url.toLowerCase();
+    if (!title.includes(q) && !url.includes(q)) continue;
+    if (!seen.has(t.url)) seen.set(t.url, { url: t.url, title: t.title || t.url });
   }
+  return Array.from(seen.values()).slice(0, 25);
+}
+
+function renderSearchResultRow(r) {
+  let domain = '';
+  try { domain = new URL(r.url).hostname.replace(/^www\./, ''); } catch {}
+  const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=16`;
+  const safeTitle = (r.title || '').replace(/"/g, '&quot;');
+  const safeUrl   = (r.url || '').replace(/"/g, '&quot;');
+  return `
+    <div class="search-result" draggable="true" data-result-url="${safeUrl}" data-result-title="${safeTitle}" title="拖到任意分组保存">
+      <img class="search-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">
+      <div class="search-result-info">
+        <div class="search-result-title">${r.title || r.url}</div>
+        <div class="search-result-meta"><span>${domain}</span></div>
+      </div>
+    </div>`;
+}
+
+function runReadingSearch(query) {
+  const resultsEl = document.getElementById('readingSearchResults');
+  if (!resultsEl) return;
+  const results = searchOpenTabs(query);
+  if (results.length === 0) {
+    resultsEl.innerHTML = '<div class="search-empty">没找到匹配的 open tab</div>';
+  } else {
+    const bulkHandle = `
+      <div class="search-drag-all" draggable="true" title="把这 ${results.length} 条全部一起拖到某个分组">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.75" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M16.5 8.25V6a2.25 2.25 0 0 0-2.25-2.25H6A2.25 2.25 0 0 0 3.75 6v8.25A2.25 2.25 0 0 0 6 16.5h2.25m8.25-8.25H18a2.25 2.25 0 0 1 2.25 2.25V18A2.25 2.25 0 0 1 18 20.25h-8.25A2.25 2.25 0 0 1 7.5 18v-1.5m8.25-8.25h-6a2.25 2.25 0 0 0-2.25 2.25v6" /></svg>
+      </div>`;
+    resultsEl.innerHTML = bulkHandle + results.map(renderSearchResultRow).join('');
+  }
+  resultsEl.style.display = 'block';
+}
+
+// Debounced input handler
+let searchDebounceTimer = null;
+document.addEventListener('input', (e) => {
+  if (e.target.id !== 'readingSearch') return;
+  const q = e.target.value.trim();
+  const clearBtn = document.getElementById('readingSearchClear');
+  const resultsEl = document.getElementById('readingSearchResults');
+  if (clearBtn) clearBtn.style.display = q ? 'flex' : 'none';
+
+  clearTimeout(searchDebounceTimer);
+  if (q.length < 2) {
+    if (resultsEl) { resultsEl.style.display = 'none'; resultsEl.innerHTML = ''; }
+    return;
+  }
+  searchDebounceTimer = setTimeout(() => runReadingSearch(q), 180);
 });
 
-// ---- Archive search — filter archived items as user types ----
-document.addEventListener('input', async (e) => {
-  if (e.target.id !== 'archiveSearch') return;
+// Clear button
+document.addEventListener('click', (e) => {
+  if (e.target.id !== 'readingSearchClear') return;
+  const input    = document.getElementById('readingSearch');
+  const results  = document.getElementById('readingSearchResults');
+  const clearBtn = document.getElementById('readingSearchClear');
+  if (input) { input.value = ''; input.focus(); }
+  if (results) { results.style.display = 'none'; results.innerHTML = ''; }
+  if (clearBtn) clearBtn.style.display = 'none';
+});
 
-  const q = e.target.value.trim().toLowerCase();
-  const archiveList = document.getElementById('archiveList');
-  if (!archiveList) return;
 
-  try {
-    const { archived } = await getSavedTabs();
+/* ----------------------------------------------------------------
+   OBSIDIAN EXPORT — File System Access API + IndexedDB-persisted handle
 
-    if (q.length < 2) {
-      // Show all archived items
-      archiveList.innerHTML = archived.map(item => renderArchiveItem(item)).join('');
+   First click: user picks the target .md file (e.g. 网页清单.md).
+   Subsequent clicks: handle re-used; user may see a one-click
+   "allow access this session" prompt after browser restart.
+
+   We only replace the block between two HTML-comment fences so the
+   user's manually-written content in the same file stays untouched.
+   ---------------------------------------------------------------- */
+
+const OBS_FENCE_START = '<!-- tab-out:reading:start -->';
+const OBS_FENCE_END   = '<!-- tab-out:reading:end -->';
+const OBS_IDB_NAME    = 'tabout-obsidian';
+const OBS_IDB_STORE   = 'handles';
+const OBS_IDB_KEY     = 'reading-list-file';
+
+function obsidianIdbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(OBS_IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(OBS_IDB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+async function obsidianSaveHandle(handle) {
+  const db = await obsidianIdbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(OBS_IDB_STORE, 'readwrite');
+    tx.objectStore(OBS_IDB_STORE).put(handle, OBS_IDB_KEY);
+    tx.oncomplete = () => resolve();
+    tx.onerror    = () => reject(tx.error);
+  });
+}
+
+async function obsidianLoadHandle() {
+  const db = await obsidianIdbOpen();
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(OBS_IDB_STORE, 'readonly');
+    const req = tx.objectStore(OBS_IDB_STORE).get(OBS_IDB_KEY);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+async function renderReadingMarkdown() {
+  const [groups, items] = await Promise.all([getGroups(), getDeferredItems()]);
+  const lines = [];
+  const today = new Date().toISOString().slice(0, 10);
+  lines.push(`<!-- updated ${today} by tab-out -->`);
+  lines.push('');
+
+  const fmt = (t) => {
+    const title = (t.title || t.url).replace(/[\[\]]/g, ' ').trim();
+    return `- [ ] [${title}](${t.url})`;
+  };
+
+  for (const g of groups) {
+    const groupItems = items.filter(t => t.groupId === g.id);
+    if (groupItems.length === 0) continue;
+    lines.push(`## ${g.name}`);
+    for (const t of groupItems) lines.push(fmt(t));
+    lines.push('');
+  }
+
+  const unsorted = items.filter(t => t.groupId == null);
+  if (unsorted.length > 0) {
+    lines.push('## 待整理');
+    for (const t of unsorted) lines.push(fmt(t));
+    lines.push('');
+  }
+
+  return lines.join('\n').trimEnd();
+}
+
+async function exportReadingToObsidian() {
+  if (!window.showOpenFilePicker) {
+    showToast('当前浏览器不支持文件系统访问');
+    return;
+  }
+
+  let handle = await obsidianLoadHandle();
+
+  if (!handle) {
+    try {
+      const picked = await window.showOpenFilePicker({
+        types: [{ description: 'Markdown', accept: { 'text/markdown': ['.md'] } }],
+        multiple: false,
+        startIn: 'documents',
+      });
+      handle = picked[0];
+      await obsidianSaveHandle(handle);
+    } catch (err) {
+      return; // user cancelled
+    }
+  }
+
+  // Make sure we still have permission this session
+  const perm = await handle.queryPermission({ mode: 'readwrite' });
+  if (perm !== 'granted') {
+    const next = await handle.requestPermission({ mode: 'readwrite' });
+    if (next !== 'granted') {
+      showToast('未授权写入');
       return;
     }
+  }
 
-    // Filter by title or URL containing the query string
-    const results = archived.filter(item =>
-      (item.title || '').toLowerCase().includes(q) ||
-      (item.url  || '').toLowerCase().includes(q)
-    );
-
-    archiveList.innerHTML = results.map(item => renderArchiveItem(item)).join('')
-      || '<div style="font-size:12px;color:var(--muted);padding:8px 0">No results</div>';
+  let existing = '';
+  try {
+    const file = await handle.getFile();
+    existing = await file.text();
   } catch (err) {
-    console.warn('[tab-out] Archive search failed:', err);
+    console.warn('[tab-out] could not read existing file:', err);
+  }
+
+  const block   = await renderReadingMarkdown();
+  const wrapped = `${OBS_FENCE_START}\n${block}\n${OBS_FENCE_END}`;
+
+  let updated;
+  const startIdx = existing.indexOf(OBS_FENCE_START);
+  const endIdx   = existing.indexOf(OBS_FENCE_END);
+  if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+    const before = existing.slice(0, startIdx);
+    const after  = existing.slice(endIdx + OBS_FENCE_END.length);
+    updated = before + wrapped + after;
+  } else {
+    const sep = (existing && !existing.endsWith('\n')) ? '\n\n' : (existing ? '\n' : '');
+    updated = existing + sep + wrapped + '\n';
+  }
+
+  try {
+    const writable = await handle.createWritable();
+    await writable.write(updated);
+    await writable.close();
+    showToast('已同步到 Obsidian');
+  } catch (err) {
+    console.error('[tab-out] write failed:', err);
+    showToast('写入失败');
+  }
+}
+
+
+/* ----------------------------------------------------------------
+   CONFIRM MODAL — in-page replacement for window.confirm()
+   (Chrome new-tab override pages may suppress native modal dialogs.)
+   ---------------------------------------------------------------- */
+
+function showConfirm(title, body = '', { okText = '确认', cancelText = '取消', destructive = false } = {}) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    overlay.innerHTML = `
+      <div class="confirm-modal" role="dialog" aria-modal="true">
+        <div class="confirm-title">${title}</div>
+        ${body ? `<div class="confirm-body">${body}</div>` : ''}
+        <div class="confirm-actions">
+          <button class="confirm-btn confirm-cancel">${cancelText}</button>
+          <button class="confirm-btn confirm-ok${destructive ? ' destructive' : ''}">${okText}</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const cleanup = (result) => {
+      overlay.classList.add('closing');
+      document.removeEventListener('keydown', onKey);
+      setTimeout(() => overlay.remove(), 120);
+      resolve(result);
+    };
+
+    overlay.querySelector('.confirm-cancel').addEventListener('click', () => cleanup(false));
+    overlay.querySelector('.confirm-ok').addEventListener('click', () => cleanup(true));
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(false); });
+
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); cleanup(false); }
+      if (e.key === 'Enter')  { e.preventDefault(); cleanup(true);  }
+    };
+    document.addEventListener('keydown', onKey);
+
+    // Default focus on cancel so Enter doesn't accidentally confirm a destructive op
+    overlay.querySelector(destructive ? '.confirm-cancel' : '.confirm-ok').focus();
+  });
+}
+
+
+/* ----------------------------------------------------------------
+   DRAG & DROP — chips and saved items into group sections
+   ---------------------------------------------------------------- */
+
+let dragPayload = null; // { type: 'chip', url, title } | { type: 'item', id }
+
+document.addEventListener('dragstart', (e) => {
+  // Don't drag when the user grabbed an interactive button inside a card
+  if (e.target.closest('.chip-actions button, .actions button')) {
+    e.preventDefault();
+    return;
+  }
+
+  const chip      = e.target.closest('.page-chip[draggable="true"]');
+  const item      = e.target.closest('.deferred-item[draggable="true"]');
+  const card      = e.target.closest('.mission-card[draggable="true"]');
+  const search    = e.target.closest('.search-result[draggable="true"]');
+  const bulkAll   = e.target.closest('.search-drag-all[draggable="true"]');
+  const groupHdl  = e.target.closest('.group-handle[draggable="true"]');
+
+  if (groupHdl) {
+    const section = groupHdl.closest('.group-section');
+    const groupId = section?.dataset.groupId;
+    if (!groupId) { e.preventDefault(); return; }
+    dragPayload = { type: 'group', id: groupId };
+    section.classList.add('dragging');
+  } else if (bulkAll) {
+    // Drag the entire current search-results set at once → card-style drop
+    const container = document.getElementById('readingSearchResults');
+    const rows = container ? container.querySelectorAll('.search-result[draggable="true"]') : [];
+    const tabs = Array.from(rows).map(r => ({
+      url:   r.dataset.resultUrl,
+      title: r.dataset.resultTitle || r.dataset.resultUrl,
+    }));
+    if (tabs.length === 0) { e.preventDefault(); return; }
+    dragPayload = { type: 'card', tabs };
+    bulkAll.classList.add('dragging');
+  } else if (search) {
+    // Same payload as a chip — dropping closes that tab too
+    dragPayload = {
+      type:  'chip',
+      url:   search.dataset.resultUrl,
+      title: search.dataset.resultTitle || search.dataset.resultUrl,
+    };
+    search.classList.add('dragging');
+  } else if (chip) {
+    dragPayload = {
+      type:  'chip',
+      url:   chip.dataset.tabUrl,
+      title: chip.dataset.tabTitle || chip.dataset.tabUrl,
+    };
+    chip.classList.add('dragging');
+  } else if (item) {
+    dragPayload = { type: 'item', id: item.dataset.deferredId };
+    item.classList.add('dragging');
+  } else if (card) {
+    // Drag an entire open-tabs group → save all its tabs at once
+    const chips = card.querySelectorAll('.page-chip[data-tab-url]');
+    const tabs = Array.from(chips).map(c => ({
+      url:   c.dataset.tabUrl,
+      title: c.dataset.tabTitle || c.dataset.tabUrl,
+    }));
+    if (tabs.length === 0) { e.preventDefault(); return; }
+    dragPayload = { type: 'card', tabs };
+    card.classList.add('dragging');
+  } else {
+    return;
+  }
+
+  e.dataTransfer.effectAllowed = 'move';
+  try { e.dataTransfer.setData('text/plain', dragPayload.url || dragPayload.id || ''); } catch {}
+  document.body.classList.add('drag-active');
+});
+
+/* ----------------------------------------------------------------
+   Edge auto-scroll while dragging — lets the user reach groups that
+   are scrolled out of view inside .deferred-column
+   ---------------------------------------------------------------- */
+
+let dragScrollRAF = null;
+let dragScrollEl  = null;
+let dragScrollSpeed = 0;
+
+function maybeStartDragScroll(target, clientY) {
+  if (!target) { stopDragScroll(); return; }
+  const r = target.getBoundingClientRect();
+  const EDGE = 100;
+  let speed = 0;
+
+  if (clientY < r.top + EDGE) {
+    const dist = (r.top + EDGE) - clientY;
+    speed = -Math.min(14, 2 + dist / 4);
+  } else if (clientY > r.bottom - EDGE) {
+    const dist = clientY - (r.bottom - EDGE);
+    speed = Math.min(14, 2 + dist / 4);
+  }
+
+  dragScrollSpeed = speed;
+  dragScrollEl    = target;
+
+  if (speed === 0) return; // outside edge zone — nothing to do
+
+  if (!dragScrollRAF) {
+    const step = () => {
+      if (!dragScrollEl || dragScrollSpeed === 0) { dragScrollRAF = null; return; }
+      dragScrollEl.scrollTop += dragScrollSpeed;
+      dragScrollRAF = requestAnimationFrame(step);
+    };
+    dragScrollRAF = requestAnimationFrame(step);
+  }
+}
+
+function stopDragScroll() {
+  dragScrollSpeed = 0;
+  dragScrollEl    = null;
+  if (dragScrollRAF) { cancelAnimationFrame(dragScrollRAF); dragScrollRAF = null; }
+}
+
+// Flash recently-added items so the user sees where they landed
+async function flashDroppedItems(ids) {
+  await new Promise(r => requestAnimationFrame(r));
+  for (const id of ids) {
+    const el = document.querySelector(`.deferred-item[data-deferred-id="${id}"]`);
+    if (el) {
+      el.classList.add('just-dropped');
+      setTimeout(() => el.classList.remove('just-dropped'), 750);
+    }
+  }
+}
+
+async function flashGroup(groupId) {
+  await new Promise(r => requestAnimationFrame(r));
+  const sel = groupId == null
+    ? '.group-section.unsorted-section'
+    : `.group-section[data-group-id="${groupId}"]`;
+  const el = document.querySelector(sel);
+  if (el) {
+    el.classList.add('just-dropped');
+    setTimeout(() => el.classList.remove('just-dropped'), 750);
+  }
+}
+
+// If dropping into a collapsed group, expand it so the dropped item is visible
+async function ensureGroupExpanded(groupId) {
+  if (groupId == null) {
+    if (await getUnsortedCollapsed()) await toggleUnsortedCollapsed();
+  } else {
+    const groups = await getGroups();
+    const g = groups.find(x => x.id === groupId);
+    if (g && g.collapsed) await toggleGroupCollapsed(groupId);
+  }
+}
+
+function clearPreviewExpand() {
+  document.querySelectorAll('.group-section.preview-expand').forEach(el => el.classList.remove('preview-expand'));
+}
+
+function clearGroupDropIndicators() {
+  document.querySelectorAll('.group-section.drop-above, .group-section.drop-below')
+    .forEach(el => el.classList.remove('drop-above', 'drop-below'));
+}
+
+// For a group-reorder drag, pick the target gap based on cursor Y.
+// Returns { section, position: 'above' | 'below' } or null.
+function computeGroupDropTarget(clientY) {
+  const sections = Array.from(document.querySelectorAll(
+    '.groups-wrap .group-section:not(.unsorted-section)'
+  ));
+  if (sections.length === 0) return null;
+  for (const sec of sections) {
+    const r = sec.getBoundingClientRect();
+    if (clientY < r.top + r.height / 2) return { section: sec, position: 'above' };
+  }
+  return { section: sections[sections.length - 1], position: 'below' };
+}
+
+document.addEventListener('dragend', () => {
+  document.body.classList.remove('drag-active');
+  document.querySelectorAll('.dragging').forEach(el => el.classList.remove('dragging'));
+  document.querySelectorAll('.group-section.drag-over').forEach(el => el.classList.remove('drag-over'));
+  clearGroupDropIndicators();
+  clearPreviewExpand();
+  stopDragScroll();
+  dragPayload = null;
+});
+
+document.addEventListener('dragover', (e) => {
+  if (!dragPayload) return;
+
+  // Edge auto-scroll: if cursor is near top/bottom of the Reading column,
+  // scroll it so the user can reach groups outside the viewport
+  const deferredCol = document.getElementById('deferredColumn');
+  if (deferredCol && deferredCol.contains(e.target)) {
+    maybeStartDragScroll(deferredCol, e.clientY);
+  } else {
+    stopDragScroll();
+  }
+
+  // Reordering a group: show insertion indicator between sections
+  if (dragPayload.type === 'group') {
+    const wrap = e.target.closest('.groups-wrap');
+    if (!wrap) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const target = computeGroupDropTarget(e.clientY);
+    clearGroupDropIndicators();
+    if (target && target.section.dataset.groupId !== dragPayload.id) {
+      target.section.classList.add(target.position === 'above' ? 'drop-above' : 'drop-below');
+    }
+    return;
+  }
+
+  // All other drag types: highlight the hovered group section as a save target
+  const section = e.target.closest('.group-section');
+  if (!section) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  document.querySelectorAll('.group-section.drag-over').forEach(el => {
+    if (el !== section) el.classList.remove('drag-over');
+  });
+  section.classList.add('drag-over');
+
+  // If hovering a collapsed group, preview-expand it so the user can see
+  // what's inside before committing the drop
+  document.querySelectorAll('.group-section.preview-expand').forEach(el => {
+    if (el !== section) el.classList.remove('preview-expand');
+  });
+  if (section.classList.contains('collapsed')) section.classList.add('preview-expand');
+});
+
+document.addEventListener('dragleave', (e) => {
+  const section = e.target.closest('.group-section');
+  if (!section) return;
+  if (!section.contains(e.relatedTarget)) section.classList.remove('drag-over');
+});
+
+document.addEventListener('drop', async (e) => {
+  if (!dragPayload) return;
+
+  // Group reorder
+  if (dragPayload.type === 'group') {
+    e.preventDefault();
+    const wrap = e.target.closest('.groups-wrap');
+    if (!wrap) { clearGroupDropIndicators(); dragPayload = null; return; }
+    const target = computeGroupDropTarget(e.clientY);
+    clearGroupDropIndicators();
+    const id = dragPayload.id;
+    dragPayload = null;
+    if (!target || target.section.dataset.groupId === id) return;
+
+    const groups = await getGroups();
+    const fromIdx = groups.findIndex(g => g.id === id);
+    const targetIdx = groups.findIndex(g => g.id === target.section.dataset.groupId);
+    if (fromIdx === -1 || targetIdx === -1) return;
+    let toIdx = target.position === 'above' ? targetIdx : targetIdx + 1;
+    if (fromIdx < toIdx) toIdx--; // splice-then-insert adjustment
+    if (toIdx === fromIdx) return;
+    await moveGroup(id, toIdx);
+    await renderDeferredColumn();
+    flashGroup(id);
+    return;
+  }
+
+  const section = e.target.closest('.group-section');
+  if (!section) return;
+  e.preventDefault();
+  section.classList.remove('drag-over');
+
+  const groupIdAttr = section.dataset.groupId;
+  const groupId = groupIdAttr === '' ? UNSORTED_GROUP_ID : groupIdAttr;
+  const payload = dragPayload;
+  dragPayload = null;
+
+  if (payload.type === 'chip') {
+    try {
+      await ensureGroupExpanded(groupId);
+      const item = await saveTabToGroup({ url: payload.url, title: payload.title }, groupId);
+      const allTabs = await chrome.tabs.query({});
+      const match   = allTabs.find(t => t.url === payload.url);
+      if (match) await chrome.tabs.remove(match.id);
+      await fetchOpenTabs();
+      await renderStaticDashboard(); // refresh left column too
+      const searchInput = document.getElementById('readingSearch');
+      if (searchInput && searchInput.value.trim().length >= 2) runReadingSearch(searchInput.value.trim());
+      flashDroppedItems([item.id]);
+      showToast(groupId ? 'Saved to group' : 'Saved to 待整理');
+    } catch (err) {
+      console.error('[tab-out] drop save failed:', err);
+      showToast('Failed to save');
+    }
+  } else if (payload.type === 'item') {
+    try {
+      await ensureGroupExpanded(groupId);
+      await moveItemToGroup(payload.id, groupId);
+      await renderDeferredColumn();
+      flashDroppedItems([payload.id]);
+      showToast('Moved');
+    } catch (err) {
+      console.error('[tab-out] drop move failed:', err);
+    }
+  } else if (payload.type === 'card') {
+    try {
+      await ensureGroupExpanded(groupId);
+      const newIds = [];
+      for (const t of payload.tabs) {
+        const item = await saveTabToGroup({ url: t.url, title: t.title }, groupId);
+        newIds.push(item.id);
+      }
+      const urls = new Set(payload.tabs.map(t => t.url));
+      const allTabs = await chrome.tabs.query({});
+      const tabIds = allTabs.filter(t => urls.has(t.url)).map(t => t.id);
+      if (tabIds.length) await chrome.tabs.remove(tabIds);
+      await fetchOpenTabs();
+      await renderStaticDashboard();
+      const searchInput = document.getElementById('readingSearch');
+      if (searchInput && searchInput.value.trim().length >= 2) runReadingSearch(searchInput.value.trim());
+      flashDroppedItems(newIds);
+      showToast(`Saved ${payload.tabs.length} tab${payload.tabs.length !== 1 ? 's' : ''} to group`);
+    } catch (err) {
+      console.error('[tab-out] drop card failed:', err);
+      showToast('Failed to save group');
+    }
   }
 });
 
@@ -1570,4 +2241,8 @@ document.addEventListener('input', async (e) => {
 /* ----------------------------------------------------------------
    INITIALIZE
    ---------------------------------------------------------------- */
-renderDashboard();
+renderDashboard().finally(() => {
+  // After the intro animations finish, drop the body class so future
+  // re-renders (post drop / drag) don't replay fadeUp on every card.
+  setTimeout(() => document.body.classList.remove('first-render'), 1200);
+});
