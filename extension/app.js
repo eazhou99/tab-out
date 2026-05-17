@@ -293,6 +293,28 @@ async function toggleUnsortedCollapsed() {
   await chrome.storage.local.set({ unsortedCollapsed: !cur });
 }
 
+/**
+ * extractGroupAsTabs(groupId)
+ *
+ * Opens every item in the given group as a new background tab and
+ * removes those items from Reading (keeping the open / saved invariant).
+ * The group itself stays (so the user can refill it later).
+ */
+async function extractGroupAsTabs(groupId) {
+  const items = await getDeferredItems();
+  const groupItems = items.filter(t => t.groupId === groupId);
+  if (groupItems.length === 0) return 0;
+
+  for (const item of groupItems) {
+    try { await chrome.tabs.create({ url: item.url, active: false }); }
+    catch (err) { console.warn('[tab-out] could not open', item.url, err); }
+  }
+
+  const remaining = items.filter(t => t.groupId !== groupId);
+  await chrome.storage.local.set({ deferred: remaining });
+  return groupItems.length;
+}
+
 async function moveGroup(id, toIndex) {
   const groups = await getGroups();
   const fromIdx = groups.findIndex(g => g.id === id);
@@ -329,6 +351,37 @@ async function moveItemToGroup(itemId, groupId) {
   if (!t) return;
   t.groupId = groupId;
   await chrome.storage.local.set({ deferred });
+}
+
+/**
+ * closeTabsMatchingUrls(urls)
+ *
+ * Closes every open Chrome tab whose URL matches any in `urls`.
+ * Used to keep Reading's invariant: if it's saved, it shouldn't be open.
+ */
+async function closeTabsMatchingUrls(urls) {
+  if (!urls || urls.length === 0) return 0;
+  const set = urls instanceof Set ? urls : new Set(urls);
+  const extensionId = chrome.runtime.id;
+  const ownUrl = `chrome-extension://${extensionId}/index.html`;
+  const tabs = await chrome.tabs.query({});
+  const ids = tabs
+    .filter(t => t.url && t.url !== ownUrl && set.has(t.url))
+    .map(t => t.id);
+  if (ids.length > 0) await chrome.tabs.remove(ids);
+  return ids.length;
+}
+
+/**
+ * reconcileOpenTabsWithReading()
+ *
+ * Anything saved in Reading should NOT be open as a tab. Walks the
+ * Reading list and closes any open tab whose URL is in it.
+ */
+async function reconcileOpenTabsWithReading() {
+  const items = await getDeferredItems();
+  const urls = new Set(items.map(t => t.url).filter(Boolean));
+  return closeTabsMatchingUrls(urls);
 }
 
 async function removeSavedItem(id) {
@@ -1452,9 +1505,7 @@ document.addEventListener('click', async (e) => {
       return;
     }
 
-    const allTabs = await chrome.tabs.query({});
-    const match   = allTabs.find(t => t.url === tabUrl);
-    if (match) await chrome.tabs.remove(match.id);
+    await closeTabsMatchingUrls([tabUrl]);
     await fetchOpenTabs();
 
     const chip = actionEl.closest('.page-chip');
@@ -1987,6 +2038,31 @@ document.addEventListener('dragstart', (e) => {
 });
 
 /* ----------------------------------------------------------------
+   Click on a Reading link → open tab + remove from Reading
+   (let the <a target="_blank"> default open the tab; we just clean up)
+   ---------------------------------------------------------------- */
+document.addEventListener('click', (e) => {
+  // Only modifier-less left-clicks should consume the item.
+  // Middle-click / cmd-click / ctrl-click already open in new tab via the
+  // browser; we still want to remove from Reading in those cases too.
+  const link = e.target.closest('.group-body .deferred-item .deferred-title');
+  if (!link) return;
+  const itemEl = link.closest('.deferred-item');
+  const id = itemEl?.dataset.deferredId;
+  if (!id) return;
+
+  // Let the browser open the link normally — don't preventDefault.
+  // After a short delay (enough for the new tab to appear), clean up.
+  setTimeout(async () => {
+    await removeSavedItem(id);
+    await fetchOpenTabs();
+    await renderStaticDashboard();
+    await renderDeferredColumn();
+  }, 350);
+});
+
+
+/* ----------------------------------------------------------------
    Edge auto-scroll while dragging — lets the user reach groups that
    are scrolled out of view inside .deferred-column
    ---------------------------------------------------------------- */
@@ -2092,6 +2168,7 @@ document.addEventListener('dragend', () => {
   document.body.classList.remove('drag-active');
   document.querySelectorAll('.dragging').forEach(el => el.classList.remove('dragging'));
   document.querySelectorAll('.group-section.drag-over').forEach(el => el.classList.remove('drag-over'));
+  document.querySelectorAll('.extract-target').forEach(el => el.classList.remove('extract-target'));
   clearGroupDropIndicators();
   clearPreviewExpand();
   stopDragScroll();
@@ -2110,17 +2187,35 @@ document.addEventListener('dragover', (e) => {
     stopDragScroll();
   }
 
-  // Reordering a group: show insertion indicator between sections
+  // Group drag: reorder within Reading, OR extract to Open Tabs depending on destination
   if (dragPayload.type === 'group') {
-    const wrap = e.target.closest('.groups-wrap');
-    if (!wrap) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    const target = computeGroupDropTarget(e.clientY);
-    clearGroupDropIndicators();
-    if (target && target.section.dataset.groupId !== dragPayload.id) {
-      target.section.classList.add(target.position === 'above' ? 'drop-above' : 'drop-below');
+    const wrap        = e.target.closest('.groups-wrap');
+    const openTabsBox = e.target.closest('#openTabsSection');
+
+    if (wrap) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const target = computeGroupDropTarget(e.clientY);
+      clearGroupDropIndicators();
+      document.querySelectorAll('.extract-target').forEach(el => el.classList.remove('extract-target'));
+      if (target && target.section.dataset.groupId !== dragPayload.id) {
+        target.section.classList.add(target.position === 'above' ? 'drop-above' : 'drop-below');
+      }
+      return;
     }
+    if (openTabsBox) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      clearGroupDropIndicators();
+      document.querySelectorAll('.extract-target').forEach(el => {
+        if (el !== openTabsBox) el.classList.remove('extract-target');
+      });
+      openTabsBox.classList.add('extract-target');
+      return;
+    }
+
+    clearGroupDropIndicators();
+    document.querySelectorAll('.extract-target').forEach(el => el.classList.remove('extract-target'));
     return;
   }
 
@@ -2151,15 +2246,33 @@ document.addEventListener('dragleave', (e) => {
 document.addEventListener('drop', async (e) => {
   if (!dragPayload) return;
 
-  // Group reorder
+  // Group drag drop
   if (dragPayload.type === 'group') {
     e.preventDefault();
-    const wrap = e.target.closest('.groups-wrap');
-    if (!wrap) { clearGroupDropIndicators(); dragPayload = null; return; }
-    const target = computeGroupDropTarget(e.clientY);
+    const id          = dragPayload.id;
+    const wrap        = e.target.closest('.groups-wrap');
+    const openTabsBox = e.target.closest('#openTabsSection');
     clearGroupDropIndicators();
-    const id = dragPayload.id;
+    document.querySelectorAll('.extract-target').forEach(el => el.classList.remove('extract-target'));
     dragPayload = null;
+
+    // Dropped onto Open Tabs area → open all items in that group as tabs
+    if (openTabsBox) {
+      const count = await extractGroupAsTabs(id);
+      if (count > 0) {
+        await fetchOpenTabs();
+        await renderStaticDashboard();
+        await renderDeferredColumn();
+        showToast(`Opened ${count} tab${count !== 1 ? 's' : ''}`);
+      } else {
+        showToast('Group is empty');
+      }
+      return;
+    }
+
+    // Otherwise → reorder within Reading
+    if (!wrap) return;
+    const target = computeGroupDropTarget(e.clientY);
     if (!target || target.section.dataset.groupId === id) return;
 
     const groups = await getGroups();
@@ -2167,7 +2280,7 @@ document.addEventListener('drop', async (e) => {
     const targetIdx = groups.findIndex(g => g.id === target.section.dataset.groupId);
     if (fromIdx === -1 || targetIdx === -1) return;
     let toIdx = target.position === 'above' ? targetIdx : targetIdx + 1;
-    if (fromIdx < toIdx) toIdx--; // splice-then-insert adjustment
+    if (fromIdx < toIdx) toIdx--;
     if (toIdx === fromIdx) return;
     await moveGroup(id, toIdx);
     await renderDeferredColumn();
@@ -2189,9 +2302,7 @@ document.addEventListener('drop', async (e) => {
     try {
       await ensureGroupExpanded(groupId);
       const item = await saveTabToGroup({ url: payload.url, title: payload.title }, groupId);
-      const allTabs = await chrome.tabs.query({});
-      const match   = allTabs.find(t => t.url === payload.url);
-      if (match) await chrome.tabs.remove(match.id);
+      await closeTabsMatchingUrls([payload.url]);
       await fetchOpenTabs();
       await renderStaticDashboard(); // refresh left column too
       const searchInput = document.getElementById('readingSearch');
@@ -2220,10 +2331,7 @@ document.addEventListener('drop', async (e) => {
         const item = await saveTabToGroup({ url: t.url, title: t.title }, groupId);
         newIds.push(item.id);
       }
-      const urls = new Set(payload.tabs.map(t => t.url));
-      const allTabs = await chrome.tabs.query({});
-      const tabIds = allTabs.filter(t => urls.has(t.url)).map(t => t.id);
-      if (tabIds.length) await chrome.tabs.remove(tabIds);
+      await closeTabsMatchingUrls(payload.tabs.map(t => t.url));
       await fetchOpenTabs();
       await renderStaticDashboard();
       const searchInput = document.getElementById('readingSearch');
@@ -2241,8 +2349,15 @@ document.addEventListener('drop', async (e) => {
 /* ----------------------------------------------------------------
    INITIALIZE
    ---------------------------------------------------------------- */
-renderDashboard().finally(() => {
-  // After the intro animations finish, drop the body class so future
-  // re-renders (post drop / drag) don't replay fadeUp on every card.
+(async () => {
+  await renderDashboard();
+  // Anything already in Reading should not be open as a tab.
+  // Close them once on startup, then refresh so the closed tabs disappear.
+  const closed = await reconcileOpenTabsWithReading();
+  if (closed > 0) {
+    await fetchOpenTabs();
+    await renderStaticDashboard();
+    showToast(`Closed ${closed} tab${closed !== 1 ? 's' : ''} already in Reading`);
+  }
   setTimeout(() => document.body.classList.remove('first-render'), 1200);
-});
+})();

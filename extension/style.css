@@ -1217,6 +1217,51 @@ body.first-render .deferred-item {
   opacity: 0.6;
 }
 
+/* Drop target indicator when dragging a Reading group into Open Tabs.
+   Uses the same accent-primary cyan language as .group-section.drag-over
+   for consistency with every other "drop here" cue in the UI. */
+.active-section.extract-target {
+  position: relative;
+  background: rgba(var(--accent-primary-rgb), 0.08);
+  border-radius: 16px;
+  box-shadow:
+    0 0 0 1px  rgba(var(--accent-primary-rgb), 0.55) inset,
+    0 0 0 5px  rgba(var(--accent-primary-rgb), 0.14),
+    0 0 28px   rgba(var(--accent-primary-rgb), 0.18);
+  transition: background 0.15s, box-shadow 0.15s;
+}
+
+/* Centered pill — same DM Sans uppercase chip vibe used by .search-drag-all
+   hover and the action-btn family. Top-center of the section so it sits
+   exactly where the user is looking after they drag the group across. */
+.active-section.extract-target::after {
+  content: '↙  open as tabs';
+  position: absolute;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: 'DM Sans', sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  color: #ffffff;
+  background: rgba(var(--accent-primary-rgb), 0.92);
+  padding: 8px 16px;
+  border-radius: 999px;
+  pointer-events: none;
+  z-index: 50;
+  box-shadow:
+    0 6px 18px rgba(var(--accent-primary-rgb), 0.35),
+    0 0 0 4px  rgba(var(--accent-primary-rgb), 0.18);
+  animation: extractBadgeIn 0.2s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes extractBadgeIn {
+  from { opacity: 0; transform: translateX(-50%) translateY(-6px) scale(0.96); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0)    scale(1); }
+}
+
 .group-toggle {
   background: none;
   border: none;
